@@ -1,4 +1,5 @@
 import time
+import json
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
@@ -9,7 +10,7 @@ except ModuleNotFoundError:
     st = install_and_import("streamlit", "streamlit")
 
 from services.processor import process_upload
-from services.gdrive import create_subfolder, upload_file, get_drive_service
+from services.remote_api import send_to_remote
 from services.mailer import send_admin_mail
 from utils.fs import save_uploaded_file
 
@@ -35,7 +36,7 @@ def execute_job(
     wechat: str,
     email: str,
     original_filename: str,
-    gdrive_cfg: dict,
+    remote_cfg: dict,
     smtp_cfg: dict,
 ):
     """执行任务并返回结果摘要，供同步调试或异步上报使用。"""
@@ -53,34 +54,32 @@ def execute_job(
         # 1) 处理与转换
         result = process_upload(original_saved_path, user_meta)
 
-        # 2) 上传至 Google Drive（使用主线程传入的配置构建 service）
-        service = get_drive_service(gdrive_cfg)
-        parent_folder_id = gdrive_cfg["folder_id"]
-        folder_name = result["folder_name"]
-        child_id = create_subfolder(parent_folder_id, folder_name, service=service)
-        folder_url = f"https://drive.google.com/drive/folders/{child_id}"
-
-        # 2.1 上传原始文件
+        # 2) 读取 meta.json 以获取 timestamp，构建 manifest
         try:
-            upload_file(child_id, result["original_file_path"], service=service)
-            uploaded_ok.append(result["original_file_path"])
-        except Exception as e:
-            errors.append(f"原始文件上传失败: {e!r}")
+            meta_obj = json.loads(open(result["meta_path"], "r", encoding="utf-8").read())
+            timestamp = meta_obj.get("timestamp")
+        except Exception:
+            timestamp = None
 
-        # 2.2 上传转换产物
-        for html_path in result.get("html_files", []):
-            try:
-                upload_file(child_id, html_path, mime_type="text/html", service=service)
-                uploaded_ok.append(html_path)
-            except Exception as e:
-                errors.append(f"HTML 上传失败 {html_path}: {e!r}")
+        manifest = {
+            "wechat": wechat,
+            "email": email,
+            "original_filename": original_filename,
+            "folder_name": result["folder_name"],
+            "timestamp": timestamp or "",
+            # duration_ms 在下方最终填充或由服务端忽略
+        }
 
-        # 2.3 上传元数据
+        # 3) 打包并提交至远端 FastAPI（zip + manifest）
         try:
-            upload_file(child_id, result["meta_path"], mime_type="application/json", service=service)
-            uploaded_ok.append(result["meta_path"])
+            remote_resp = send_to_remote(result, manifest, remote_cfg)
+            # 记录一些反馈信息
+            folder_url = remote_resp.get("folder")  # 服务器返回的相对目录名
+            uploaded_ok.extend(result.get("html_files", []))
+            uploaded_ok.append(result.get("meta_path"))
+            uploaded_ok.append(result.get("original_file_path"))
         except Exception as e:
-            errors.append(f"元数据上传失败: {e!r}")
+            errors.append(f"上报远端失败: {e!r}")
     except Exception as e:
         errors.append(f"处理/建链路失败: {e!r}\n{traceback.format_exc()}")
 
@@ -97,7 +96,7 @@ def execute_job(
             f"微信号: {wechat}",
             f"原始文件: {original_filename}",
             f"耗时: {duration}ms",
-            f"Drive 文件夹: {folder_url or '未创建'}",
+            f"远端存储: {folder_url or '未创建'}",
             f"成功上传: {len(uploaded_ok)} 个",
             f"MD 数量: {len(result['md_files']) if result else 'N/A'}",
             f"HTML 数量: {len(result['html_files']) if result else 'N/A'}",
@@ -128,7 +127,7 @@ def run_job(
     wechat: str,
     email: str,
     original_filename: str,
-    gdrive_cfg: dict,
+    remote_cfg: dict,
     smtp_cfg: dict,
 ) -> None:
     """在后台线程执行处理、上传与通知（异步）。"""
@@ -137,7 +136,7 @@ def run_job(
         wechat,
         email,
         original_filename,
-        gdrive_cfg,
+        remote_cfg,
         smtp_cfg,
     )
 
@@ -188,7 +187,7 @@ def main():
         except Exception:
             debug_sync = False
 
-        gdrive_cfg = dict(st.secrets["gdrive"])  # 复制为普通 dict
+        remote_cfg = dict(st.secrets["remote"])  # 复制为普通 dict（base_url, token, verify_ssl）
         smtp_cfg = dict(st.secrets["smtp"])      # 复制为普通 dict
 
         if debug_sync:
@@ -199,7 +198,7 @@ def main():
                     wechat.strip(),
                     email.strip(),
                     uploaded.name,
-                    gdrive_cfg,
+                    remote_cfg,
                     smtp_cfg,
                 )
                 status.update(label="处理完成", state="complete")
@@ -210,7 +209,7 @@ def main():
             else:
                 st.success("上传成功！")
             if summary["folder_url"]:
-                st.write(f"Drive 文件夹: {summary['folder_url']}")
+                st.write(f"远端存储: {summary['folder_url']}")
             if summary.get("result"):
                 st.caption("处理摘要：")
                 st.json({
@@ -227,14 +226,14 @@ def main():
                 wechat.strip(),
                 email.strip(),
                 uploaded.name,
-                gdrive_cfg,
+                remote_cfg,
                 smtp_cfg,
             )
 
             # 立即向用户反馈
             with st.status("已接收上传，正在后台处理…", expanded=True) as status:
                 st.write("1) 文件已上传并入队处理")
-                st.write("2) 解压/转换/上传至 Drive 将在后台进行")
+                st.write("2) 解压/转换/上报至远端存储将在后台进行")
                 st.write("3) 管理员审核后会通过邮件通知您")
                 time.sleep(0.8)
                 status.update(label="处理任务已入队", state="complete")
