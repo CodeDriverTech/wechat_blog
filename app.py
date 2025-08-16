@@ -13,7 +13,7 @@ from services.gdrive import create_subfolder, upload_file, get_drive_service
 from services.mailer import send_admin_mail
 from utils.fs import save_uploaded_file
 
-APP_TITLE = "CodeDriver推文投稿入口（Markdown/ZIP 转微信公众号 HTML）"
+APP_TITLE = "CodeDriver推文投稿入口（MD/ZIP 转公众号 HTML）"
 MAX_UPLOAD_MB = 200
 
 
