@@ -41,6 +41,14 @@ def run_job(
     """在后台线程执行处理、上传与通知。
     注意：不得在此函数中直接调用任何 st.* API。
     """
+    import traceback
+    start_ts = time.time()
+    child_id = None
+    folder_url = None
+    uploaded_ok = []
+    errors = []
+    result = None
+
     try:
         user_meta = {"wechat": wechat, "email": email}
 
@@ -52,35 +60,60 @@ def run_job(
         parent_folder_id = gdrive_cfg["folder_id"]
         folder_name = result["folder_name"]
         child_id = create_subfolder(parent_folder_id, folder_name, service=service)
-
-        # 上传原始文件
-        upload_file(child_id, result["original_file_path"], service=service)  # mime 自动识别即可
-
-        # 上传转换产物
-        for html_path in result["html_files"]:
-            upload_file(child_id, html_path, mime_type="text/html", service=service)
-
-        # 上传元数据
-        upload_file(child_id, result["meta_path"], mime_type="application/json", service=service)
-
-        # 3) 通知管理员
         folder_url = f"https://drive.google.com/drive/folders/{child_id}"
-        subject = f"[新推文提交] {email} / {wechat}"
-        body = (
-            f"用户邮箱: {email}\n"
-            f"微信号: {wechat}\n"
-            f"原始文件: {original_filename}\n"
-            f"Drive 文件夹: {folder_url}\n"
-            f"MD 数量: {len(result['md_files'])}\n"
-            f"HTML 数量: {len(result['html_files'])}\n"
-        )
-        send_admin_mail(subject, body, smtp_cfg=smtp_cfg)
-    except Exception as e:
-        # 子线程中不可用 st.*，使用 print 输出到控制台日志
-        import traceback
 
-        print("[后台任务失败]", e)
-        print(traceback.format_exc())
+        # 2.1 上传原始文件
+        try:
+            upload_file(child_id, result["original_file_path"], service=service)
+            uploaded_ok.append(result["original_file_path"])
+        except Exception as e:
+            errors.append(f"原始文件上传失败: {e!r}")
+
+        # 2.2 上传转换产物
+        for html_path in result.get("html_files", []):
+            try:
+                upload_file(child_id, html_path, mime_type="text/html", service=service)
+                uploaded_ok.append(html_path)
+            except Exception as e:
+                errors.append(f"HTML 上传失败 {html_path}: {e!r}")
+
+        # 2.3 上传元数据
+        try:
+            upload_file(child_id, result["meta_path"], mime_type="application/json", service=service)
+            uploaded_ok.append(result["meta_path"])
+        except Exception as e:
+            errors.append(f"元数据上传失败: {e!r}")
+    except Exception as e:
+        errors.append(f"处理/建链路失败: {e!r}\n{traceback.format_exc()}")
+    finally:
+        # 3) 无论成功或失败都通知管理员
+        duration = int((time.time() - start_ts) * 1000)
+        try:
+            if errors:
+                subject = f"[推文提交失败告警] {email} / {wechat}"
+            else:
+                subject = f"[新推文提交] {email} / {wechat}"
+
+            lines = [
+                f"用户邮箱: {email}",
+                f"微信号: {wechat}",
+                f"原始文件: {original_filename}",
+                f"耗时: {duration}ms",
+                f"Drive 文件夹: {folder_url or '未创建'}",
+                f"成功上传: {len(uploaded_ok)} 个",
+                f"MD 数量: {len(result['md_files']) if result else 'N/A'}",
+                f"HTML 数量: {len(result['html_files']) if result else 'N/A'}",
+            ]
+            if uploaded_ok:
+                lines.append("成功文件:\n" + "\n".join(uploaded_ok))
+            if errors:
+                lines.append("错误详情:\n" + "\n".join(errors))
+            body = "\n".join(lines)
+            send_admin_mail(subject, body, smtp_cfg=smtp_cfg)
+        except Exception as mail_e:
+            # 邮件失败仅打印日志
+            print("[管理员邮件发送失败]", mail_e)
+            print(traceback.format_exc())
 
 
 def main():

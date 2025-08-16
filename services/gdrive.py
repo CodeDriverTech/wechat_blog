@@ -44,17 +44,18 @@ def create_subfolder(parent_folder_id: str, name: str, service=None) -> str:
         "mimeType": "application/vnd.google-apps.folder",
         "parents": [parent_folder_id],
     }
-    folder = service.files().create(body=metadata, fields="id, name").execute()
+    folder = service.files().create(body=metadata, fields="id, name", supportsAllDrives=True).execute()
     return folder["id"]
 
 
 def upload_file(parent_id: str, file_path: str, mime_type: Optional[str] = None, service=None) -> Dict[str, Any]:
     service = service or get_drive_service()
     metadata = {"name": os.path.basename(file_path), "parents": [parent_id]}
-    media = MediaFileUpload(file_path, mimetype=mime_type, resumable=True)
+    # 在部分云环境中断点续传可能带来额外握手/协议限制，这里使用非断点续传，稳定性更高
+    media = MediaFileUpload(file_path, mimetype=mime_type, resumable=False)
     file = (
         service.files()
-        .create(body=metadata, media_body=media, fields="id, name, webViewLink, webContentLink")
+        .create(body=metadata, media_body=media, fields="id, name, webViewLink, webContentLink", supportsAllDrives=True)
         .execute()
     )
     return file
