@@ -30,17 +30,15 @@ def bytes_human(n: int) -> str:
     return f"{n:.1f}TB"
 
 
-def run_job(
+def execute_job(
     original_saved_path: str,
     wechat: str,
     email: str,
     original_filename: str,
     gdrive_cfg: dict,
     smtp_cfg: dict,
-) -> None:
-    """在后台线程执行处理、上传与通知。
-    注意：不得在此函数中直接调用任何 st.* API。
-    """
+):
+    """执行任务并返回结果摘要，供同步调试或异步上报使用。"""
     import traceback
     start_ts = time.time()
     child_id = None
@@ -85,35 +83,63 @@ def run_job(
             errors.append(f"元数据上传失败: {e!r}")
     except Exception as e:
         errors.append(f"处理/建链路失败: {e!r}\n{traceback.format_exc()}")
-    finally:
-        # 3) 无论成功或失败都通知管理员
-        duration = int((time.time() - start_ts) * 1000)
-        try:
-            if errors:
-                subject = f"[推文提交失败告警] {email} / {wechat}"
-            else:
-                subject = f"[新推文提交] {email} / {wechat}"
 
-            lines = [
-                f"用户邮箱: {email}",
-                f"微信号: {wechat}",
-                f"原始文件: {original_filename}",
-                f"耗时: {duration}ms",
-                f"Drive 文件夹: {folder_url or '未创建'}",
-                f"成功上传: {len(uploaded_ok)} 个",
-                f"MD 数量: {len(result['md_files']) if result else 'N/A'}",
-                f"HTML 数量: {len(result['html_files']) if result else 'N/A'}",
-            ]
-            if uploaded_ok:
-                lines.append("成功文件:\n" + "\n".join(uploaded_ok))
-            if errors:
-                lines.append("错误详情:\n" + "\n".join(errors))
-            body = "\n".join(lines)
-            send_admin_mail(subject, body, smtp_cfg=smtp_cfg)
-        except Exception as mail_e:
-            # 邮件失败仅打印日志
-            print("[管理员邮件发送失败]", mail_e)
-            print(traceback.format_exc())
+    # 3) 发送管理员通知（成功或失败）
+    duration = int((time.time() - start_ts) * 1000)
+    try:
+        if errors:
+            subject = f"[推文提交失败告警] {email} / {wechat}"
+        else:
+            subject = f"[新推文提交] {email} / {wechat}"
+
+        lines = [
+            f"用户邮箱: {email}",
+            f"微信号: {wechat}",
+            f"原始文件: {original_filename}",
+            f"耗时: {duration}ms",
+            f"Drive 文件夹: {folder_url or '未创建'}",
+            f"成功上传: {len(uploaded_ok)} 个",
+            f"MD 数量: {len(result['md_files']) if result else 'N/A'}",
+            f"HTML 数量: {len(result['html_files']) if result else 'N/A'}",
+        ]
+        if uploaded_ok:
+            lines.append("成功文件:\n" + "\n".join(uploaded_ok))
+        if errors:
+            lines.append("错误详情:\n" + "\n".join(errors))
+        body = "\n".join(lines)
+        send_admin_mail(subject, body, smtp_cfg=smtp_cfg)
+    except Exception as mail_e:
+        # 邮件失败仅打印日志
+        print("[管理员邮件发送失败]", mail_e)
+        print(traceback.format_exc())
+
+    return {
+        "child_id": child_id,
+        "folder_url": folder_url,
+        "uploaded_ok": uploaded_ok,
+        "errors": errors,
+        "result": result,
+        "duration_ms": duration,
+    }
+
+
+def run_job(
+    original_saved_path: str,
+    wechat: str,
+    email: str,
+    original_filename: str,
+    gdrive_cfg: dict,
+    smtp_cfg: dict,
+) -> None:
+    """在后台线程执行处理、上传与通知（异步）。"""
+    execute_job(
+        original_saved_path,
+        wechat,
+        email,
+        original_filename,
+        gdrive_cfg,
+        smtp_cfg,
+    )
 
 
 def main():
@@ -155,30 +181,66 @@ def main():
         # 落盘保存
         work_dir, saved_path = save_uploaded_file(uploaded)
 
-        # 入队后台任务（将 secrets 在主线程读取并以纯 dict 传入子线程）
-        executor = get_executor()
+        # 读取调试开关：secrets.debug.sync = true 时，同步执行以在页面展示错误
+        debug_sync = False
+        try:
+            debug_sync = bool(st.secrets.get("debug", {}).get("sync", False))
+        except Exception:
+            debug_sync = False
+
         gdrive_cfg = dict(st.secrets["gdrive"])  # 复制为普通 dict
         smtp_cfg = dict(st.secrets["smtp"])      # 复制为普通 dict
-        executor.submit(
-            run_job,
-            saved_path,
-            wechat.strip(),
-            email.strip(),
-            uploaded.name,
-            gdrive_cfg,
-            smtp_cfg,
-        )
 
-        # 立即向用户反馈
-        with st.status("已接收上传，正在后台处理…", expanded=True) as status:
-            st.write("1) 文件已上传并入队处理")
-            st.write("2) 解压/转换/上传至 Drive 将在后台进行")
-            st.write("3) 管理员审核后会通过邮件通知您")
-            time.sleep(0.8)
-            status.update(label="处理任务已入队", state="complete")
+        if debug_sync:
+            with st.status("正在处理（同步调试模式）…", expanded=True) as status:
+                st.write("1) 开始解压/转换/上传")
+                summary = execute_job(
+                    saved_path,
+                    wechat.strip(),
+                    email.strip(),
+                    uploaded.name,
+                    gdrive_cfg,
+                    smtp_cfg,
+                )
+                status.update(label="处理完成", state="complete")
 
-        st.success("感谢您的推文贡献！待审核通过将会自动生成一份预览链接并将通过邮件通知您！")
-        st.info("如需再次提交，可刷新页面或直接再次上传。")
+            if summary["errors"]:
+                st.error("发生错误，详情如下：")
+                st.code("\n".join(summary["errors"]))
+            else:
+                st.success("上传成功！")
+            if summary["folder_url"]:
+                st.write(f"Drive 文件夹: {summary['folder_url']}")
+            if summary.get("result"):
+                st.caption("处理摘要：")
+                st.json({
+                    "md_files": summary["result"].get("md_files"),
+                    "html_files": summary["result"].get("html_files"),
+                    "meta_path": summary["result"].get("meta_path"),
+                })
+        else:
+            # 入队后台任务（将 secrets 在主线程读取并以纯 dict 传入子线程）
+            executor = get_executor()
+            executor.submit(
+                run_job,
+                saved_path,
+                wechat.strip(),
+                email.strip(),
+                uploaded.name,
+                gdrive_cfg,
+                smtp_cfg,
+            )
+
+            # 立即向用户反馈
+            with st.status("已接收上传，正在后台处理…", expanded=True) as status:
+                st.write("1) 文件已上传并入队处理")
+                st.write("2) 解压/转换/上传至 Drive 将在后台进行")
+                st.write("3) 管理员审核后会通过邮件通知您")
+                time.sleep(0.8)
+                status.update(label="处理任务已入队", state="complete")
+
+            st.success("感谢您的推文贡献！待审核通过将会自动生成一份预览链接并将通过邮件通知您！")
+            st.info("如需再次提交，可刷新页面或直接再次上传。")
 
 
 if __name__ == "__main__":
